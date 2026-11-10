@@ -16,9 +16,9 @@ SingleFile used to capture a page you left early only at the moment it unloaded,
 
 Alongside that, three smaller repairs stop entries getting stuck in “pending saves”:
 
-Saves arriving from an already-closed tab no longer crash.
-The first save of each browser session is no longer mistaken for “no task”.
-Entries whose page has gone are cleaned up after 15 seconds.
+- Saves arriving from an already-closed tab no longer crash.
+- The first save of each browser session is no longer mistaken for “no task”.
+- Entries whose page has gone are cleaned up after 15 seconds.
 
 ## Building on Windows
 
