@@ -1,0 +1,571 @@
+From 0b01c248a3deb37ce8bcb42b023051f089869fa9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 14:38:01 +0100
+Subject: [PATCH] Fix auto-saves lost or stuck in the pending saves when the
+ page is left early
+
+- content sent on unload from a tab being closed is received without
+  sender.tab: saveContent() threw, the page was not saved and its task
+  stayed in the pending saves forever
+- Firefox can terminate the unload listener when a tab is closed: with
+  "auto-save after page load or on page unload", snapshots of the page are
+  now sent while it is waiting to be saved, and the last one is saved by
+  the background script when the page goes away unsaved
+- task ids started at 0, which was treated as "no task": the first
+  auto-save of a session never left the pending saves
+- auto-save tasks whose page is gone are now removed from the pending saves
+- the options of an unloaded page are those of its URL, not of the page
+  that replaced it in the tab
+---
+ src/core/bg/autosave.js               | 141 ++++++++++++++++++++++++--
+ src/core/bg/business.js               |  62 ++++++++++-
+ src/core/bg/tabs.js                   |   2 +-
+ src/core/content/content-bootstrap.js |  96 +++++++++++++++++-
+ 4 files changed, 282 insertions(+), 19 deletions(-)
+
+diff --git a/src/core/bg/autosave.js b/src/core/bg/autosave.js
+index 4bd330c..dfbb49f 100644
+--- a/src/core/bg/autosave.js
++++ b/src/core/bg/autosave.js
+@@ -21,7 +21,7 @@
+  *   Source.
+  */
+ 
+-/* global browser, URL, Blob */
++/* global browser, URL, Blob, setTimeout, clearTimeout */
+ 
+ import * as config from "./config.js";
+ import * as business from "./business.js";
+@@ -35,8 +35,27 @@ import { autoSaveIsEnabled } from "./autosave-util.js";
+ import { enableReferrerOnError } from "./requests.js";
+ import { fetchResource } from "./../../lib/single-file/fetch/bg/fetch.js";
+ 
++const AUTOSAVE_PORT_NAME_PREFIX = "singlefile.autosave:";
++// time left to the content sent when a page is unloaded to be received before saving the last
++// snapshot of the page instead
++const PROVISIONAL_SAVE_DELAY = 2000;
++const FLUSHED_SAVE_ID_TTL = 60000;
++
+ const pendingMessages = {};
+ const replacedTabIds = {};
++// last snapshots of the pages waiting to be auto-saved, indexed by document id
++const provisionalPages = new Map();
++const flushedSaveIds = new Set();
++
++if (browser.runtime.onConnect) {
++	browser.runtime.onConnect.addListener(port => {
++		if (port.name && port.name.startsWith(AUTOSAVE_PORT_NAME_PREFIX)) {
++			const documentId = port.name.substring(AUTOSAVE_PORT_NAME_PREFIX.length);
++			// the page is gone (tab closed, navigation, crash...)
++			port.onDisconnect.addListener(() => flushProvisionalPage(documentId));
++		}
++	});
++}
+ 
+ export {
+ 	onMessage,
+@@ -49,7 +68,25 @@ export {
+ };
+ 
+ async function onMessage(message, sender) {
++	if (message.method.endsWith(".discardProvisional")) {
++		const provisionalPage = provisionalPages.get(message.documentId);
++		if (provisionalPage) {
++			clearTimeout(provisionalPage.timeout);
++			provisionalPages.delete(message.documentId);
++		}
++		return {};
++	}
+ 	if (message.method.endsWith(".save")) {
++		// when the tab is being closed, the content sent on unload is received without sender.tab
++		const tab = sender.tab || getRemovedTab(message, sender);
++		if (message.autoSaveProvisional) {
++			setProvisionalPage(message, tab);
++			return {};
++		}
++		if (message.saveId && flushedSaveIds.has(message.saveId)) {
++			// the page has already been saved from its last snapshot
++			return {};
++		}
+ 		if (message.autoSaveDiscard || message.autoSaveRemove) {
+ 			if (sender.tab) {
+ 				message.tab = sender.tab;
+@@ -59,25 +96,92 @@ async function onMessage(message, sender) {
+ 					(pendingMessages[message.tabId].discarded && message.autoSaveDiscard))
+ 			) {
+ 				delete pendingMessages[message.tabId];
+-				await saveContent(message, { id: message.tabId, index: message.tabIndex, url: sender.url });
++				await saveContent(message, tab);
+ 			}
+ 			if (message.autoSaveUnload) {
+ 				delete pendingMessages[message.tabId];
+-				await saveContent(message, sender.tab);
++				await saveContent(message, tab);
+ 			}
+ 		} else {
+ 			delete pendingMessages[message.tabId];
+-			await saveContent(message, sender.tab);
++			await saveContent(message, tab);
+ 		}
+ 		return {};
+ 	}
+ }
+ 
++function getRemovedTab(message, sender) {
++	return {
++		id: message.tabId,
++		index: message.tabIndex,
++		url: message.url || sender.url,
++		incognito: Boolean(message.incognito),
++		removed: true
++	};
++}
++
++function setProvisionalPage(message, tab) {
++	const provisionalPage = provisionalPages.get(message.documentId);
++	// another page is displayed in the tab: the snapshot of the previous one must be saved
++	provisionalPages.forEach((otherProvisionalPage, documentId) => {
++		if (otherProvisionalPage.tab.id == tab.id && documentId != message.documentId) {
++			flushProvisionalPage(documentId);
++		}
++	});
++	provisionalPages.set(message.documentId, {
++		message,
++		tab: { id: tab.id, index: tab.index, url: message.url, incognito: tab.incognito, windowId: tab.windowId },
++		timeout: provisionalPage && provisionalPage.timeout
++	});
++}
++
++function discardProvisionalPage(message) {
++	const provisionalPage = provisionalPages.get(message.documentId);
++	if (provisionalPage && provisionalPage.message.saveId == message.saveId) {
++		clearTimeout(provisionalPage.timeout);
++		provisionalPages.delete(message.documentId);
++	}
++}
++
++function flushProvisionalPage(documentId) {
++	const provisionalPage = provisionalPages.get(documentId);
++	if (provisionalPage && !provisionalPage.timeout) {
++		provisionalPage.timeout = setTimeout(async () => {
++			// the snapshot may have been updated meanwhile
++			const lastProvisionalPage = provisionalPages.get(documentId);
++			if (!lastProvisionalPage) {
++				return;
++			}
++			const { message } = lastProvisionalPage;
++			let tab;
++			provisionalPages.delete(documentId);
++			flushedSaveIds.add(message.saveId);
++			setTimeout(() => flushedSaveIds.delete(message.saveId), FLUSHED_SAVE_ID_TTL);
++			try {
++				tab = await browser.tabs.get(lastProvisionalPage.tab.id);
++				// eslint-disable-next-line no-unused-vars
++			} catch (error) {
++				tab = Object.assign({ removed: true }, lastProvisionalPage.tab);
++			}
++			try {
++				await saveContent(message, tab);
++			} catch (error) {
++				console.error(error); // eslint-disable-line no-console
++			}
++		}, PROVISIONAL_SAVE_DELAY);
++	}
++}
++
+ function onTabUpdated(tabId) {
+ 	delete pendingMessages[tabId];
+ }
+ 
+ async function onTabRemoved(tabId) {
++	provisionalPages.forEach((provisionalPage, documentId) => {
++		if (provisionalPage.tab.id == tabId) {
++			flushProvisionalPage(documentId);
++		}
++	});
+ 	const message = pendingMessages[tabId];
+ 	if (message) {
+ 		if (message.autoSaveRemove) {
+@@ -100,6 +204,11 @@ async function onTabDiscarded(tabId) {
+ }
+ 
+ async function onTabReplaced(addedTabId, removedTabId) {
++	provisionalPages.forEach(provisionalPage => {
++		if (provisionalPage.tab.id == removedTabId) {
++			provisionalPage.tab.id = addedTabId;
++		}
++	});
+ 	if (pendingMessages[removedTabId] && !pendingMessages[addedTabId]) {
+ 		pendingMessages[addedTabId] = pendingMessages[removedTabId];
+ 		delete pendingMessages[removedTabId];
+@@ -128,9 +237,19 @@ async function onInit(tab) {
+ 
+ async function saveContent(message, tab) {
+ 	const tabId = tab.id;
+-	const options = await config.getOptions(tab.url, true);
++	const taskIdDefined = message.taskId !== undefined && message.taskId !== null;
++	if (!message.autoSaveProvisional) {
++		discardProvisionalPage(message);
++	}
++	if (taskIdDefined) {
++		business.onSaveStart(message.taskId);
++	}
++	// the tab may already display another page: the options are those of the saved page
++	const options = await config.getOptions(message.url || tab.url, true);
+ 	if (options) {
+-		ui.onStart(tabId, 1, true);
++		if (!tab.removed) {
++			ui.onStart(tabId, 1, true);
++		}
+ 		options.content = message.content;
+ 		options.url = message.url;
+ 		options.frames = message.frames;
+@@ -259,17 +378,21 @@ async function saveContent(message, tab) {
+ 				}
+ 			}
+ 		} finally {
+-			if (message.taskId) {
++			if (taskIdDefined) {
+ 				business.onSaveEnd(message.taskId);
+-			} else if (options.autoClose) {
++			} else if (options.autoClose && !tab.removed) {
+ 				browser.tabs.remove(replacedTabIds[tabId] || tabId);
+ 				delete replacedTabIds[tabId];
+ 			}
+ 			if (pageData && pageData.url) {
+ 				URL.revokeObjectURL(pageData.url);
+ 			}
+-			ui.onEnd(tabId, true);
++			if (!tab.removed) {
++				ui.onEnd(tabId, true);
++			}
+ 		}
++	} else if (taskIdDefined) {
++		business.onSaveEnd(message.taskId);
+ 	}
+ }
+ 
+diff --git a/src/core/bg/business.js b/src/core/bg/business.js
+index d4aaea9..239a1a4 100644
+--- a/src/core/bg/business.js
++++ b/src/core/bg/business.js
+@@ -21,7 +21,7 @@
+  *   Source.
+  */
+ 
+-/* global browser */
++/* global browser, setTimeout, clearTimeout */
+ 
+ import * as config from "./config.js";
+ import { autoSaveIsEnabled } from "./autosave-util.js";
+@@ -39,13 +39,17 @@ const INJECT_SCRIPTS_STEP = 1;
+ const EXECUTE_SCRIPTS_STEP = 2;
+ const TASK_PENDING_STATE = "pending";
+ const TASK_PROCESSING_STATE = "processing";
++const AUTOSAVE_METHOD = "content.autosave";
++// time left to the content of a page that is going away (tab closed, navigation) to reach the
++// background script before its auto-save task is considered as orphaned
++const AUTOSAVE_ORPHAN_DELAY = 15000;
+ 
+ const extensionScriptFiles = [
+ 	"lib/single-file-extension.js"
+ ];
+ 
+ const tasks = [];
+-let currentTaskId = 0, maxParallelWorkers, processInForeground;
++let currentTaskId = 1, maxParallelWorkers, processInForeground;
+ ui.init({ isSavingTab, saveTabs, saveUrls, cancelTab, openEditor, saveSelectedLinks, batchSaveUrls });
+ 
+ export {
+@@ -58,8 +62,10 @@ export {
+ 	getTasksInfo,
+ 	getTaskInfo,
+ 	setCancelCallback,
++	onSaveStart,
+ 	onSaveEnd,
+ 	onInit,
++	onTabRemoved,
+ 	onTabReplaced,
+ 	cancelTab as cancel
+ };
+@@ -147,7 +153,7 @@ async function saveTabs(tabs, options = {}) {
+ 						status: TASK_PROCESSING_STATE,
+ 						tab: tabData,
+ 						options: tabOptions,
+-						method: "content.autosave"
++						method: AUTOSAVE_METHOD
+ 					});
+ 					runTask(taskInfo);
+ 				}
+@@ -321,6 +327,14 @@ async function runTask(taskInfo) {
+ 		if (taskInfo.resolve && !taskInfo.cancelled) {
+ 			taskInfo.resolve(response);
+ 			taskInfo.done();
++		} else if (taskInfo.method == AUTOSAVE_METHOD) {
++			if (!response) {
++				// no content script handled the message (e.g. the page has been replaced meanwhile)
++				releaseAutoSaveTask(taskInfo);
++			} else if (response.pageAutoSaved) {
++				// the page has already been saved, no content will be sent for this task
++				taskInfo.done();
++			}
+ 		}
+ 	} catch (error) {
+ 		// the caller is waiting for a result, it must always be settled
+@@ -333,6 +347,9 @@ async function runTask(taskInfo) {
+ 			console.log(error.message ? error.message : error); // eslint-disable-line no-console
+ 			ui.onError(taskInfo.tab.id, error.message, error.link, error.stack);
+ 			taskInfo.done();
++		} else if (taskInfo.method == AUTOSAVE_METHOD) {
++			// the page went away before the message could be delivered, the task would never end
++			releaseAutoSaveTask(taskInfo);
+ 		}
+ 	}
+ }
+@@ -351,6 +368,43 @@ function isSavingTab(tab) {
+ 
+ function onInit(tab) {
+ 	cancelTab(tab.id, false);
++	// a new page is displayed in the tab, the auto-save tasks of the previous one are orphaned
++	releaseAutoSaveTasks(tab.id);
++}
++
++function onTabRemoved(tabId) {
++	cancelTab(tabId);
++	releaseAutoSaveTasks(tabId);
++}
++
++function releaseAutoSaveTasks(tabId) {
++	tasks.filter(taskInfo => taskInfo.tab.id == tabId && taskInfo.method == AUTOSAVE_METHOD).forEach(releaseAutoSaveTask);
++}
++
++// Auto-save tasks are ended when the content of the page has been saved. If the page goes away
++// (tab closed, navigation) without sending its content, the task must be removed otherwise it
++// remains in the list of the pending saves forever. The content sent when the page is unloaded
++// can be received after the event notifying that the tab is gone, hence the delay.
++function releaseAutoSaveTask(taskInfo) {
++	if (!taskInfo.saving && !taskInfo.releaseTimeout) {
++		taskInfo.releaseTimeout = setTimeout(() => {
++			taskInfo.releaseTimeout = null;
++			if (!taskInfo.saving) {
++				taskInfo.done();
++			}
++		}, AUTOSAVE_ORPHAN_DELAY);
++	}
++}
++
++function onSaveStart(taskId) {
++	const taskInfo = tasks.find(taskInfo => taskInfo.id == taskId);
++	if (taskInfo) {
++		taskInfo.saving = true;
++		if (taskInfo.releaseTimeout) {
++			clearTimeout(taskInfo.releaseTimeout);
++			taskInfo.releaseTimeout = null;
++		}
++	}
+ }
+ 
+ function onTabReplaced(addedTabId, removedTabId) {
+@@ -439,7 +493,7 @@ function cancel(taskInfo, runNextTasks) {
+ 		}).catch(() => {
+ 			// ignored
+ 		});
+-		if (taskInfo.method == "content.autosave") {
++		if (taskInfo.method == AUTOSAVE_METHOD) {
+ 			ui.onEnd(tabId, true);
+ 		}
+ 		if (!taskInfo.options.silent) {
+diff --git a/src/core/bg/tabs.js b/src/core/bg/tabs.js
+index 2fe67c6..6733bc3 100644
+--- a/src/core/bg/tabs.js
++++ b/src/core/bg/tabs.js
+@@ -107,7 +107,7 @@ async function onTabActivated(activeInfo) {
+ }
+ 
+ function onTabRemoved(tabId) {
+-	business.cancel(tabId);
++	business.onTabRemoved(tabId);
+ 	tabsData.remove(tabId);
+ 	editor.onTabRemoved(tabId);
+ 	autosave.onTabRemoved(tabId);
+diff --git a/src/core/content/content-bootstrap.js b/src/core/content/content-bootstrap.js
+index eac38b7..980128a 100644
+--- a/src/core/content/content-bootstrap.js
++++ b/src/core/content/content-bootstrap.js
+@@ -21,14 +21,19 @@
+  *   Source.
+  */
+ 
+-/* global browser, document, location, setTimeout, addEventListener, XMLHttpRequest, Node, DOMParser, Blob, URL, Image, OffscreenCanvas, CustomEvent, TextDecoder */
++/* global browser, document, location, setTimeout, clearTimeout, addEventListener, XMLHttpRequest, Node, DOMParser, Blob, URL, Image, OffscreenCanvas, CustomEvent, TextDecoder */
+ 
+ const MAX_CONTENT_SIZE = 32 * (1024 * 1024);
+ const ARCHIVE_SCAN_LENGTH = 1024 * 1024;
++const AUTOSAVE_PORT_NAME_PREFIX = "singlefile.autosave:";
++// delays (ms) between the snapshots of a page waiting to be auto-saved, see saveProvisionalPage()
++const PROVISIONAL_SAVE_DELAYS = [2000, 4000, 8000, 16000, 30000];
+ 
+ const singlefile = globalThis.singlefileBootstrap;
+ const pendingResponses = new Map();
+ 
++const documentId = String(Math.random()).substring(2) + "-" + Date.now();
++let pageIndex = 0, autoSavePort, provisionalSaveTimeout, provisionalSaveIndex, provisionalSavePageIndex, lastProvisionalContent;
+ let unloadListenerAdded, optionsAutoSave, tabId, tabIndex, autoSaveEnabled, autoSaveTimeout, autoSavingPage, pageAutoSaved, previousLocationHref, savedPageDetected, compressContent, extractDataFromPageTags, insertTextBody, insertMetaCSP;
+ singlefile.pageInfo = {
+ 	visitDate: new Date()
+@@ -127,8 +132,10 @@ function executeBootstrap(data) {
+ 
+ async function onMessage(message) {
+ 	if (autoSaveEnabled && message.method == "content.autosave") {
++		// tells the background script if no content will be sent for this task
++		const response = { pageAutoSaved: Boolean(pageAutoSaved) };
+ 		initAutoSavePage(message);
+-		return {};
++		return response;
+ 	}
+ 	if (message.method == "content.maybeInit") {
+ 		init();
+@@ -187,6 +194,7 @@ function init() {
+ 	}
+ 	if (previousLocationHref != location.href && !singlefile.pageInfo.processing) {
+ 		pageAutoSaved = false;
++		pageIndex++;
+ 		previousLocationHref = location.href;
+ 		browser.runtime.sendMessage({ method: "tabs.init", savedPageDetected: detectSavedPage(document) }).catch(() => { });
+ 		browser.runtime.sendMessage({ method: "ui.processInit" }).catch(() => { });
+@@ -195,6 +203,7 @@ function init() {
+ 
+ async function initAutoSavePage(message) {
+ 	optionsAutoSave = message.options;
++	initProvisionalSave();
+ 	if (document.readyState != "complete") {
+ 		await new Promise(resolve => globalThis.addEventListener("load", resolve));
+ 	}
+@@ -244,6 +253,57 @@ async function autoSavePage() {
+ 	}
+ }
+ 
++// The page is saved after it is loaded or, if the user leaves it before, when it is unloaded.
++// The latter is not reliable: when a tab is closed, Firefox can terminate the "unload" listener
++// before the content of the page is sent. That's why snapshots of the page are sent to the
++// background script while the page is waiting to be saved. If the page goes away without having
++// been saved, the background script saves the last snapshot it received.
++function initProvisionalSave() {
++	if (autoSaveEnabled && optionsAutoSave && optionsAutoSave.autoSaveLoadOrUnload && !pageAutoSaved && provisionalSavePageIndex !== pageIndex) {
++		cancelProvisionalSave();
++		provisionalSavePageIndex = pageIndex;
++		provisionalSaveIndex = 0;
++		saveProvisionalPage();
++	}
++}
++
++function saveProvisionalPage() {
++	provisionalSaveTimeout = null;
++	if (autoSaveEnabled && optionsAutoSave && optionsAutoSave.autoSaveLoadOrUnload && !pageAutoSaved) {
++		try {
++			const helper = singlefile.helper;
++			let frames = [];
++			if (!optionsAutoSave.removeFrames && globalThis.frames && globalThis.frames.length) {
++				frames = singlefile.processors.frameTree.getSync(optionsAutoSave);
++			}
++			const docData = helper.preProcessDoc(document, globalThis, optionsAutoSave);
++			try {
++				savePage(docData, frames, { autoSaveProvisional: true });
++			} finally {
++				helper.postProcessDoc(document, docData.markedElements, docData.invalidElements);
++				if (frames && frames.sessionId) {
++					singlefile.processors.frameTree.cleanup(frames.sessionId);
++				}
++			}
++			// eslint-disable-next-line no-unused-vars
++		} catch (error) {
++			// ignored
++		}
++		if (provisionalSaveIndex < PROVISIONAL_SAVE_DELAYS.length) {
++			provisionalSaveTimeout = setTimeout(saveProvisionalPage, PROVISIONAL_SAVE_DELAYS[provisionalSaveIndex]);
++			provisionalSaveIndex++;
++		}
++	}
++}
++
++function cancelProvisionalSave() {
++	if (provisionalSaveTimeout) {
++		clearTimeout(provisionalSaveTimeout);
++		provisionalSaveTimeout = null;
++	}
++	lastProvisionalContent = null;
++}
++
+ function refresh() {
+ 	if (autoSaveEnabled && optionsAutoSave && (optionsAutoSave.autoSaveUnload || optionsAutoSave.autoSaveLoadOrUnload || optionsAutoSave.autoSaveDiscard || optionsAutoSave.autoSaveRemove)) {
+ 		if (!unloadListenerAdded) {
+@@ -251,10 +311,18 @@ function refresh() {
+ 			document.addEventListener("visibilitychange", onVisibilityChange);
+ 			unloadListenerAdded = true;
+ 		}
++		// the first snapshot is taken as soon as possible, without waiting for the background script
++		initProvisionalSave();
+ 	} else {
+ 		globalThis.removeEventListener("unload", onUnload);
+ 		document.removeEventListener("visibilitychange", onVisibilityChange);
+ 		unloadListenerAdded = false;
++		if (provisionalSavePageIndex !== undefined) {
++			// auto-save has been disabled, the snapshots already sent must not be saved
++			cancelProvisionalSave();
++			provisionalSavePageIndex = undefined;
++			browser.runtime.sendMessage({ method: "autosave.discardProvisional", documentId }).catch(() => { });
++		}
+ 	}
+ }
+ 
+@@ -284,15 +352,31 @@ function autoSaveUnloadedPage({ autoSaveUnload, autoSaveDiscard, autoSaveRemove
+ 	savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove });
+ }
+ 
+-function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove } = {}) {
++function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove, autoSaveProvisional } = {}) {
+ 	const helper = singlefile.helper;
+ 	const visitDate = singlefile.pageInfo.visitDate.getTime();
++	const content = helper.serialize(document);
++	if (autoSaveProvisional) {
++		if (content == lastProvisionalContent) {
++			return;
++		}
++		lastProvisionalContent = content;
++		if (!autoSavePort && browser.runtime.connect) {
++			// the disconnection of the port tells the background script that the page is gone
++			autoSavePort = browser.runtime.connect({ name: AUTOSAVE_PORT_NAME_PREFIX + documentId });
++			autoSavePort.onDisconnect.addListener(() => autoSavePort = null);
++		}
++	} else {
++		cancelProvisionalSave();
++	}
+ 	browser.runtime.sendMessage({
+ 		method: "autosave.save",
+ 		tabId,
+ 		tabIndex,
+ 		taskId: optionsAutoSave.taskId,
+-		content: helper.serialize(document),
++		documentId,
++		saveId: documentId + "/" + pageIndex,
++		content,
+ 		canvases: docData.canvases,
+ 		fonts: docData.fonts,
+ 		stylesheets: docData.stylesheets,
+@@ -306,10 +390,12 @@ function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRe
+ 		worklets: docData.worklets,
+ 		frames: frames,
+ 		url: location.href,
++		incognito: browser.extension.inIncognitoContext,
+ 		visitDate,
+ 		autoSaveUnload,
+ 		autoSaveDiscard,
+-		autoSaveRemove
++		autoSaveRemove,
++		autoSaveProvisional
+ 	});
+ }
+ 
+-- 
+2.43.0
+
