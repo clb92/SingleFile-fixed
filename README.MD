@@ -7,15 +7,18 @@ This fork attempts to fix auto-saved pages being missed or getting stuck in
 has finished. The changes are on the `autosave-fix` branch (November 2026).
 The patch was developed by Claude Fable 5.2.
 
-The fix makes the page send a snapshot to the extension’s background as soon as
-it is readable, refreshed a few times while it loads. If the page then vanishes
-without a finished save, the background saves the last snapshot itself.
-
-This SingleFile version works fine on my machine now, although quickly
-closing opened tabs again feels a little bit sluggish.
-
 This is not the official SingleFile extension. For documentation, releases and
 support, see the original project.
+
+## Description of the fix
+
+SingleFile used to capture a page you left early only at the moment it unloaded, and on a closed tab Firefox often kills that capture half-way, or delivers it without tab info, which crashed the save. The fix makes the page send a snapshot to the extension’s background as soon as it is readable, refreshed a few times while it loads. If the page then vanishes without a finished save, the background saves the last snapshot itself.
+
+Alongside that, three smaller repairs stop entries getting stuck in “pending saves”:
+
+Saves arriving from an already-closed tab no longer crash.
+The first save of each browser session is no longer mistaken for “no task”.
+Entries whose page has gone are cleaned up after 15 seconds.
 
 ## Building on Windows
 
