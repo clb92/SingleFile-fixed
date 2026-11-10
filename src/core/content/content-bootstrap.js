@@ -21,14 +21,19 @@
  *   Source.
  */
 
-/* global browser, document, location, setTimeout, addEventListener, XMLHttpRequest, Node, DOMParser, Blob, URL, Image, OffscreenCanvas, CustomEvent, TextDecoder */
+/* global browser, document, location, setTimeout, clearTimeout, addEventListener, XMLHttpRequest, Node, DOMParser, Blob, URL, Image, OffscreenCanvas, CustomEvent, TextDecoder */
 
 const MAX_CONTENT_SIZE = 32 * (1024 * 1024);
 const ARCHIVE_SCAN_LENGTH = 1024 * 1024;
+const AUTOSAVE_PORT_NAME_PREFIX = "singlefile.autosave:";
+// delays (ms) between the snapshots of a page waiting to be auto-saved, see saveProvisionalPage()
+const PROVISIONAL_SAVE_DELAYS = [2000, 4000, 8000, 16000, 30000];
 
 const singlefile = globalThis.singlefileBootstrap;
 const pendingResponses = new Map();
 
+const documentId = String(Math.random()).substring(2) + "-" + Date.now();
+let pageIndex = 0, autoSavePort, provisionalSaveTimeout, provisionalSaveIndex, provisionalSavePageIndex, lastProvisionalContent;
 let unloadListenerAdded, optionsAutoSave, tabId, tabIndex, autoSaveEnabled, autoSaveTimeout, autoSavingPage, pageAutoSaved, previousLocationHref, savedPageDetected, compressContent, extractDataFromPageTags, insertTextBody, insertMetaCSP;
 singlefile.pageInfo = {
 	visitDate: new Date()
@@ -127,8 +132,10 @@ function executeBootstrap(data) {
 
 async function onMessage(message) {
 	if (autoSaveEnabled && message.method == "content.autosave") {
+		// tells the background script if no content will be sent for this task
+		const response = { pageAutoSaved: Boolean(pageAutoSaved) };
 		initAutoSavePage(message);
-		return {};
+		return response;
 	}
 	if (message.method == "content.maybeInit") {
 		init();
@@ -187,6 +194,7 @@ function init() {
 	}
 	if (previousLocationHref != location.href && !singlefile.pageInfo.processing) {
 		pageAutoSaved = false;
+		pageIndex++;
 		previousLocationHref = location.href;
 		browser.runtime.sendMessage({ method: "tabs.init", savedPageDetected: detectSavedPage(document) }).catch(() => { });
 		browser.runtime.sendMessage({ method: "ui.processInit" }).catch(() => { });
@@ -195,6 +203,7 @@ function init() {
 
 async function initAutoSavePage(message) {
 	optionsAutoSave = message.options;
+	initProvisionalSave();
 	if (document.readyState != "complete") {
 		await new Promise(resolve => globalThis.addEventListener("load", resolve));
 	}
@@ -244,6 +253,57 @@ async function autoSavePage() {
 	}
 }
 
+// The page is saved after it is loaded or, if the user leaves it before, when it is unloaded.
+// The latter is not reliable: when a tab is closed, Firefox can terminate the "unload" listener
+// before the content of the page is sent. That's why snapshots of the page are sent to the
+// background script while the page is waiting to be saved. If the page goes away without having
+// been saved, the background script saves the last snapshot it received.
+function initProvisionalSave() {
+	if (autoSaveEnabled && optionsAutoSave && optionsAutoSave.autoSaveLoadOrUnload && !pageAutoSaved && provisionalSavePageIndex !== pageIndex) {
+		cancelProvisionalSave();
+		provisionalSavePageIndex = pageIndex;
+		provisionalSaveIndex = 0;
+		saveProvisionalPage();
+	}
+}
+
+function saveProvisionalPage() {
+	provisionalSaveTimeout = null;
+	if (autoSaveEnabled && optionsAutoSave && optionsAutoSave.autoSaveLoadOrUnload && !pageAutoSaved) {
+		try {
+			const helper = singlefile.helper;
+			let frames = [];
+			if (!optionsAutoSave.removeFrames && globalThis.frames && globalThis.frames.length) {
+				frames = singlefile.processors.frameTree.getSync(optionsAutoSave);
+			}
+			const docData = helper.preProcessDoc(document, globalThis, optionsAutoSave);
+			try {
+				savePage(docData, frames, { autoSaveProvisional: true });
+			} finally {
+				helper.postProcessDoc(document, docData.markedElements, docData.invalidElements);
+				if (frames && frames.sessionId) {
+					singlefile.processors.frameTree.cleanup(frames.sessionId);
+				}
+			}
+			// eslint-disable-next-line no-unused-vars
+		} catch (error) {
+			// ignored
+		}
+		if (provisionalSaveIndex < PROVISIONAL_SAVE_DELAYS.length) {
+			provisionalSaveTimeout = setTimeout(saveProvisionalPage, PROVISIONAL_SAVE_DELAYS[provisionalSaveIndex]);
+			provisionalSaveIndex++;
+		}
+	}
+}
+
+function cancelProvisionalSave() {
+	if (provisionalSaveTimeout) {
+		clearTimeout(provisionalSaveTimeout);
+		provisionalSaveTimeout = null;
+	}
+	lastProvisionalContent = null;
+}
+
 function refresh() {
 	if (autoSaveEnabled && optionsAutoSave && (optionsAutoSave.autoSaveUnload || optionsAutoSave.autoSaveLoadOrUnload || optionsAutoSave.autoSaveDiscard || optionsAutoSave.autoSaveRemove)) {
 		if (!unloadListenerAdded) {
@@ -251,10 +311,18 @@ function refresh() {
 			document.addEventListener("visibilitychange", onVisibilityChange);
 			unloadListenerAdded = true;
 		}
+		// the first snapshot is taken as soon as possible, without waiting for the background script
+		initProvisionalSave();
 	} else {
 		globalThis.removeEventListener("unload", onUnload);
 		document.removeEventListener("visibilitychange", onVisibilityChange);
 		unloadListenerAdded = false;
+		if (provisionalSavePageIndex !== undefined) {
+			// auto-save has been disabled, the snapshots already sent must not be saved
+			cancelProvisionalSave();
+			provisionalSavePageIndex = undefined;
+			browser.runtime.sendMessage({ method: "autosave.discardProvisional", documentId }).catch(() => { });
+		}
 	}
 }
 
@@ -284,15 +352,31 @@ function autoSaveUnloadedPage({ autoSaveUnload, autoSaveDiscard, autoSaveRemove 
 	savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove });
 }
 
-function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove } = {}) {
+function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRemove, autoSaveProvisional } = {}) {
 	const helper = singlefile.helper;
 	const visitDate = singlefile.pageInfo.visitDate.getTime();
+	const content = helper.serialize(document);
+	if (autoSaveProvisional) {
+		if (content == lastProvisionalContent) {
+			return;
+		}
+		lastProvisionalContent = content;
+		if (!autoSavePort && browser.runtime.connect) {
+			// the disconnection of the port tells the background script that the page is gone
+			autoSavePort = browser.runtime.connect({ name: AUTOSAVE_PORT_NAME_PREFIX + documentId });
+			autoSavePort.onDisconnect.addListener(() => autoSavePort = null);
+		}
+	} else {
+		cancelProvisionalSave();
+	}
 	browser.runtime.sendMessage({
 		method: "autosave.save",
 		tabId,
 		tabIndex,
 		taskId: optionsAutoSave.taskId,
-		content: helper.serialize(document),
+		documentId,
+		saveId: documentId + "/" + pageIndex,
+		content,
 		canvases: docData.canvases,
 		fonts: docData.fonts,
 		stylesheets: docData.stylesheets,
@@ -306,10 +390,12 @@ function savePage(docData, frames, { autoSaveUnload, autoSaveDiscard, autoSaveRe
 		worklets: docData.worklets,
 		frames: frames,
 		url: location.href,
+		incognito: browser.extension.inIncognitoContext,
 		visitDate,
 		autoSaveUnload,
 		autoSaveDiscard,
-		autoSaveRemove
+		autoSaveRemove,
+		autoSaveProvisional
 	});
 }
 

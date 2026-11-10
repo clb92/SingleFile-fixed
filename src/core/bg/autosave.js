@@ -21,7 +21,7 @@
  *   Source.
  */
 
-/* global browser, URL, Blob */
+/* global browser, URL, Blob, setTimeout, clearTimeout */
 
 import * as config from "./config.js";
 import * as business from "./business.js";
@@ -35,8 +35,27 @@ import { autoSaveIsEnabled } from "./autosave-util.js";
 import { enableReferrerOnError } from "./requests.js";
 import { fetchResource } from "./../../lib/single-file/fetch/bg/fetch.js";
 
+const AUTOSAVE_PORT_NAME_PREFIX = "singlefile.autosave:";
+// time left to the content sent when a page is unloaded to be received before saving the last
+// snapshot of the page instead
+const PROVISIONAL_SAVE_DELAY = 2000;
+const FLUSHED_SAVE_ID_TTL = 60000;
+
 const pendingMessages = {};
 const replacedTabIds = {};
+// last snapshots of the pages waiting to be auto-saved, indexed by document id
+const provisionalPages = new Map();
+const flushedSaveIds = new Set();
+
+if (browser.runtime.onConnect) {
+	browser.runtime.onConnect.addListener(port => {
+		if (port.name && port.name.startsWith(AUTOSAVE_PORT_NAME_PREFIX)) {
+			const documentId = port.name.substring(AUTOSAVE_PORT_NAME_PREFIX.length);
+			// the page is gone (tab closed, navigation, crash...)
+			port.onDisconnect.addListener(() => flushProvisionalPage(documentId));
+		}
+	});
+}
 
 export {
 	onMessage,
@@ -49,7 +68,25 @@ export {
 };
 
 async function onMessage(message, sender) {
+	if (message.method.endsWith(".discardProvisional")) {
+		const provisionalPage = provisionalPages.get(message.documentId);
+		if (provisionalPage) {
+			clearTimeout(provisionalPage.timeout);
+			provisionalPages.delete(message.documentId);
+		}
+		return {};
+	}
 	if (message.method.endsWith(".save")) {
+		// when the tab is being closed, the content sent on unload is received without sender.tab
+		const tab = sender.tab || getRemovedTab(message, sender);
+		if (message.autoSaveProvisional) {
+			setProvisionalPage(message, tab);
+			return {};
+		}
+		if (message.saveId && flushedSaveIds.has(message.saveId)) {
+			// the page has already been saved from its last snapshot
+			return {};
+		}
 		if (message.autoSaveDiscard || message.autoSaveRemove) {
 			if (sender.tab) {
 				message.tab = sender.tab;
@@ -59,17 +96,79 @@ async function onMessage(message, sender) {
 					(pendingMessages[message.tabId].discarded && message.autoSaveDiscard))
 			) {
 				delete pendingMessages[message.tabId];
-				await saveContent(message, { id: message.tabId, index: message.tabIndex, url: sender.url });
+				await saveContent(message, tab);
 			}
 			if (message.autoSaveUnload) {
 				delete pendingMessages[message.tabId];
-				await saveContent(message, sender.tab);
+				await saveContent(message, tab);
 			}
 		} else {
 			delete pendingMessages[message.tabId];
-			await saveContent(message, sender.tab);
+			await saveContent(message, tab);
 		}
 		return {};
+	}
+}
+
+function getRemovedTab(message, sender) {
+	return {
+		id: message.tabId,
+		index: message.tabIndex,
+		url: message.url || sender.url,
+		incognito: Boolean(message.incognito),
+		removed: true
+	};
+}
+
+function setProvisionalPage(message, tab) {
+	const provisionalPage = provisionalPages.get(message.documentId);
+	// another page is displayed in the tab: the snapshot of the previous one must be saved
+	provisionalPages.forEach((otherProvisionalPage, documentId) => {
+		if (otherProvisionalPage.tab.id == tab.id && documentId != message.documentId) {
+			flushProvisionalPage(documentId);
+		}
+	});
+	provisionalPages.set(message.documentId, {
+		message,
+		tab: { id: tab.id, index: tab.index, url: message.url, incognito: tab.incognito, windowId: tab.windowId },
+		timeout: provisionalPage && provisionalPage.timeout
+	});
+}
+
+function discardProvisionalPage(message) {
+	const provisionalPage = provisionalPages.get(message.documentId);
+	if (provisionalPage && provisionalPage.message.saveId == message.saveId) {
+		clearTimeout(provisionalPage.timeout);
+		provisionalPages.delete(message.documentId);
+	}
+}
+
+function flushProvisionalPage(documentId) {
+	const provisionalPage = provisionalPages.get(documentId);
+	if (provisionalPage && !provisionalPage.timeout) {
+		provisionalPage.timeout = setTimeout(async () => {
+			// the snapshot may have been updated meanwhile
+			const lastProvisionalPage = provisionalPages.get(documentId);
+			if (!lastProvisionalPage) {
+				return;
+			}
+			const { message } = lastProvisionalPage;
+			let tab;
+			provisionalPages.delete(documentId);
+			flushedSaveIds.add(message.saveId);
+			setTimeout(() => flushedSaveIds.delete(message.saveId), FLUSHED_SAVE_ID_TTL);
+			try {
+				tab = await browser.tabs.get(lastProvisionalPage.tab.id);
+				// eslint-disable-next-line no-unused-vars
+			} catch (error) {
+				tab = Object.assign({ removed: true }, lastProvisionalPage.tab);
+			}
+			try {
+				await saveContent(message, tab);
+			} catch (error) {
+				console.error(error); // eslint-disable-line no-console
+			}
+		}, PROVISIONAL_SAVE_DELAY);
 	}
 }
 
@@ -78,6 +177,11 @@ function onTabUpdated(tabId) {
 }
 
 async function onTabRemoved(tabId) {
+	provisionalPages.forEach((provisionalPage, documentId) => {
+		if (provisionalPage.tab.id == tabId) {
+			flushProvisionalPage(documentId);
+		}
+	});
 	const message = pendingMessages[tabId];
 	if (message) {
 		if (message.autoSaveRemove) {
@@ -100,6 +204,11 @@ async function onTabDiscarded(tabId) {
 }
 
 async function onTabReplaced(addedTabId, removedTabId) {
+	provisionalPages.forEach(provisionalPage => {
+		if (provisionalPage.tab.id == removedTabId) {
+			provisionalPage.tab.id = addedTabId;
+		}
+	});
 	if (pendingMessages[removedTabId] && !pendingMessages[addedTabId]) {
 		pendingMessages[addedTabId] = pendingMessages[removedTabId];
 		delete pendingMessages[removedTabId];
@@ -128,9 +237,19 @@ async function onInit(tab) {
 
 async function saveContent(message, tab) {
 	const tabId = tab.id;
-	const options = await config.getOptions(tab.url, true);
+	const taskIdDefined = message.taskId !== undefined && message.taskId !== null;
+	if (!message.autoSaveProvisional) {
+		discardProvisionalPage(message);
+	}
+	if (taskIdDefined) {
+		business.onSaveStart(message.taskId);
+	}
+	// the tab may already display another page: the options are those of the saved page
+	const options = await config.getOptions(message.url || tab.url, true);
 	if (options) {
-		ui.onStart(tabId, 1, true);
+		if (!tab.removed) {
+			ui.onStart(tabId, 1, true);
+		}
 		options.content = message.content;
 		options.url = message.url;
 		options.frames = message.frames;
@@ -259,17 +378,21 @@ async function saveContent(message, tab) {
 				}
 			}
 		} finally {
-			if (message.taskId) {
+			if (taskIdDefined) {
 				business.onSaveEnd(message.taskId);
-			} else if (options.autoClose) {
+			} else if (options.autoClose && !tab.removed) {
 				browser.tabs.remove(replacedTabIds[tabId] || tabId);
 				delete replacedTabIds[tabId];
 			}
 			if (pageData && pageData.url) {
 				URL.revokeObjectURL(pageData.url);
 			}
-			ui.onEnd(tabId, true);
+			if (!tab.removed) {
+				ui.onEnd(tabId, true);
+			}
 		}
+	} else if (taskIdDefined) {
+		business.onSaveEnd(message.taskId);
 	}
 }
 

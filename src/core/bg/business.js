@@ -21,7 +21,7 @@
  *   Source.
  */
 
-/* global browser */
+/* global browser, setTimeout, clearTimeout */
 
 import * as config from "./config.js";
 import { autoSaveIsEnabled } from "./autosave-util.js";
@@ -39,13 +39,17 @@ const INJECT_SCRIPTS_STEP = 1;
 const EXECUTE_SCRIPTS_STEP = 2;
 const TASK_PENDING_STATE = "pending";
 const TASK_PROCESSING_STATE = "processing";
+const AUTOSAVE_METHOD = "content.autosave";
+// time left to the content of a page that is going away (tab closed, navigation) to reach the
+// background script before its auto-save task is considered as orphaned
+const AUTOSAVE_ORPHAN_DELAY = 15000;
 
 const extensionScriptFiles = [
 	"lib/single-file-extension.js"
 ];
 
 const tasks = [];
-let currentTaskId = 0, maxParallelWorkers, processInForeground;
+let currentTaskId = 1, maxParallelWorkers, processInForeground;
 ui.init({ isSavingTab, saveTabs, saveUrls, cancelTab, openEditor, saveSelectedLinks, batchSaveUrls });
 
 export {
@@ -58,8 +62,10 @@ export {
 	getTasksInfo,
 	getTaskInfo,
 	setCancelCallback,
+	onSaveStart,
 	onSaveEnd,
 	onInit,
+	onTabRemoved,
 	onTabReplaced,
 	cancelTab as cancel
 };
@@ -147,7 +153,7 @@ async function saveTabs(tabs, options = {}) {
 						status: TASK_PROCESSING_STATE,
 						tab: tabData,
 						options: tabOptions,
-						method: "content.autosave"
+						method: AUTOSAVE_METHOD
 					});
 					runTask(taskInfo);
 				}
@@ -321,6 +327,14 @@ async function runTask(taskInfo) {
 		if (taskInfo.resolve && !taskInfo.cancelled) {
 			taskInfo.resolve(response);
 			taskInfo.done();
+		} else if (taskInfo.method == AUTOSAVE_METHOD) {
+			if (!response) {
+				// no content script handled the message (e.g. the page has been replaced meanwhile)
+				releaseAutoSaveTask(taskInfo);
+			} else if (response.pageAutoSaved) {
+				// the page has already been saved, no content will be sent for this task
+				taskInfo.done();
+			}
 		}
 	} catch (error) {
 		// the caller is waiting for a result, it must always be settled
@@ -333,6 +347,9 @@ async function runTask(taskInfo) {
 			console.log(error.message ? error.message : error); // eslint-disable-line no-console
 			ui.onError(taskInfo.tab.id, error.message, error.link, error.stack);
 			taskInfo.done();
+		} else if (taskInfo.method == AUTOSAVE_METHOD) {
+			// the page went away before the message could be delivered, the task would never end
+			releaseAutoSaveTask(taskInfo);
 		}
 	}
 }
@@ -351,6 +368,43 @@ function isSavingTab(tab) {
 
 function onInit(tab) {
 	cancelTab(tab.id, false);
+	// a new page is displayed in the tab, the auto-save tasks of the previous one are orphaned
+	releaseAutoSaveTasks(tab.id);
+}
+
+function onTabRemoved(tabId) {
+	cancelTab(tabId);
+	releaseAutoSaveTasks(tabId);
+}
+
+function releaseAutoSaveTasks(tabId) {
+	tasks.filter(taskInfo => taskInfo.tab.id == tabId && taskInfo.method == AUTOSAVE_METHOD).forEach(releaseAutoSaveTask);
+}
+
+// Auto-save tasks are ended when the content of the page has been saved. If the page goes away
+// (tab closed, navigation) without sending its content, the task must be removed otherwise it
+// remains in the list of the pending saves forever. The content sent when the page is unloaded
+// can be received after the event notifying that the tab is gone, hence the delay.
+function releaseAutoSaveTask(taskInfo) {
+	if (!taskInfo.saving && !taskInfo.releaseTimeout) {
+		taskInfo.releaseTimeout = setTimeout(() => {
+			taskInfo.releaseTimeout = null;
+			if (!taskInfo.saving) {
+				taskInfo.done();
+			}
+		}, AUTOSAVE_ORPHAN_DELAY);
+	}
+}
+
+function onSaveStart(taskId) {
+	const taskInfo = tasks.find(taskInfo => taskInfo.id == taskId);
+	if (taskInfo) {
+		taskInfo.saving = true;
+		if (taskInfo.releaseTimeout) {
+			clearTimeout(taskInfo.releaseTimeout);
+			taskInfo.releaseTimeout = null;
+		}
+	}
 }
 
 function onTabReplaced(addedTabId, removedTabId) {
@@ -439,7 +493,7 @@ function cancel(taskInfo, runNextTasks) {
 		}).catch(() => {
 			// ignored
 		});
-		if (taskInfo.method == "content.autosave") {
+		if (taskInfo.method == AUTOSAVE_METHOD) {
 			ui.onEnd(tabId, true);
 		}
 		if (!taskInfo.options.silent) {
